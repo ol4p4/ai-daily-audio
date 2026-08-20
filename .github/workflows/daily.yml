@@ -1,0 +1,57 @@
+name: AI Daily Briefing
+
+on:
+  schedule:
+    - cron: "0 23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generate-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install edge-tts feedparser
+
+      - name: Run main script
+        env:
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          NEWS_SOURCES: ${{ secrets.NEWS_SOURCES }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LLM_API_BASE: ${{ secrets.LLM_API_BASE }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+        run: |
+          python generate.py
+
+      - name: Upload briefing
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-briefing
+          path: |
+            briefings/*.md
+          retention-days: 30
+
+      - name: Log result
+        if: always()
+        run: |
+          echo "Exit code: $?"

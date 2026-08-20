@@ -1,0 +1,6 @@
+# .gitignore for ai-daily-audio
+.env
+*.pyc
+__pycache__/
+ai-daily-*.mp3
+*.mp3
