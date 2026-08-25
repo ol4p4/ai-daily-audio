@@ -61,14 +61,45 @@ def send_email(subject: str, body_html: str, audio_path: Path = None) -> bool:
         return False
 
 
-def make_email_body(news_items: list[dict], audio_filename: str = "") -> str:
-    """生成 HTML 邮件正文"""
+def make_email_body(
+    news_items: list[dict],
+    audio_filename: str = "",
+    titles_zh: list[str] = None,
+    degraded: bool = False,
+) -> str:
+    """生成 HTML 邮件正文。
+
+    titles_zh: LLM 生成的各条新闻中文标题（与 news_items 顺序对应），有则中文标题为主、英文原文为辅；
+    degraded: AI 翻译服务失败时的告警模式，列表回退英文原标题并显示警示条。
+    """
+    titles_zh = titles_zh or []
+
+    banner = ""
+    if degraded:
+        banner = """
+    <div style="background:#FFF3CD;border:1px solid #FFC107;border-radius:6px;padding:10px 14px;margin-bottom:16px;color:#856404;">
+        ⚠️ 今日 AI 翻译服务不可用，本邮件仅列出英文原文新闻，无中文播报稿和语音版。
+    </div>"""
+
     items_html = ""
     for i, item in enumerate(news_items, 1):
+        zh = titles_zh[i - 1] if i - 1 < len(titles_zh) else ""
+        en = item.get("title", "")
+        link = item.get("link", "")
+        source = item.get("source", "")
+
+        if zh:
+            head_html = f"{i}. {zh}"
+            sub_html = f'<a href="{link}" style="font-size:11px;color:#999;">原文：{en}</a>' if link else f'<span style="font-size:11px;color:#999;">{en}</span>'
+        else:
+            head_html = f'{i}. <a href="{link}" style="color:inherit;">{en[:100]}</a>' if link else f"{i}. {en[:100]}"
+            sub_html = ""
+
         items_html += f"""
         <div style="margin:8px 0;padding:8px;border-left:3px solid #4A90D9;">
-            <strong>{i}. {item.get('title', '')[:100]}</strong>
-            <p style="font-size:12px;color:#666;">{item.get('source', '')}</p>
+            <strong>{head_html}</strong>
+            <p style="font-size:12px;color:#666;margin:4px 0 0;">{source}</p>
+            {f'<p style="margin:2px 0 0;">{sub_html}</p>' if sub_html else ''}
         </div>
         """
 
@@ -76,6 +107,7 @@ def make_email_body(news_items: list[dict], audio_filename: str = "") -> str:
 <html>
 <body style="font-family:system-ui;max-width:600px;margin:0 auto;padding:20px;">
     <h2 style="color:#1a1a2e;">🤖 AI Daily Audio</h2>
+    {banner}
     <p>今天早报已完成生成，包含 {len(news_items)} 条资讯：</p>
     {items_html}
     <hr>
