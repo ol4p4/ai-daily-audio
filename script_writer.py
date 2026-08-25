@@ -4,6 +4,7 @@ AI 播报稿生成模块 - 全领域
 出站请求统一走 safe_http 校验（防 SSRF）
 """
 import json
+import re
 import time
 from config import Config
 from safe_http import open_url
@@ -32,9 +33,42 @@ SYSTEM_PROMPT = """你是一位专业的中文新闻播音员。你的任务是�
 - 播报稿全文控制在 2000-3000 字
 
 【输出格式】
-必须输出如下 JSON，不要输出任何其他文字，不要用 markdown 代码块包裹：
-{"script": "完整中文播报稿", "titles_zh": ["第1条的中文标题", "第2条的中文标题"]}
-titles_zh 数组长度必须等于输入新闻条数，顺序与输入一致，每条不超过 25 个汉字。"""
+直接给出最终结果，不要输出任何思考过程、解释或 markdown 代码块。回复必须严格遵循以下结构：
+
+【中文标题】
+第1条中文标题；第2条中文标题；第3条中文标题
+【播报稿】
+早上好，以下是今天的全球要闻。……（完整播报稿正文）
+
+【中文标题】行用分号分隔，共 N 条，与输入顺序一致，每条不超过 25 个汉字；【播报稿】后面是完整播报稿全文。"""
+
+_THINK_RE = re.compile(r"<think>.*?</think>", flags=re.S)
+_OPENING = "早上好，以下是今天的全球要闻"
+
+
+def _cjk_ratio(text: str) -> float:
+    """文本中 CJK 字符占比，用于判断是否为中文成品稿"""
+    if not text:
+        return 0.0
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    return cjk / max(len(text), 1)
+
+
+def _split_titles(raw: str, expected_count: int) -> list[str]:
+    """把标题段按分号/换行拆开，去掉编号前缀，截到 expected_count 条"""
+    raw = re.sub(r"^\s*\d+[\.、\)\)]\s*", "", raw, flags=re.M)
+    return [t.strip(" .。") for t in re.split(r"[；;\n]+", raw) if t.strip()][:expected_count]
+
+
+def _harvest_numbered_titles(head: str) -> str:
+    """无标记时从导语里捞『编号+含中文的短句』，拼回分号分隔串"""
+    frags = re.split(r"\d+\s*[\.、\)\)]\s*", head)
+    kept = []
+    for f in frags:
+        f = f.strip().replace("\n", " ")
+        if 2 <= len(f) <= 40 and any("\u4e00" <= ch <= "\u9fff" for ch in f):
+            kept.append(f)
+    return "；".join(kept)
 
 
 def _extract_response_text(result: dict) -> str:
@@ -50,26 +84,37 @@ def _extract_response_text(result: dict) -> str:
     return ""
 
 
-def _parse_llm_json(text: str, expected_count: int) -> tuple[str, list[str]]:
-    """解析 LLM 返回的 JSON；解析不出时把整段文本当作播报稿（标题留空）"""
-    raw = text.strip()
-    # 容错：剥掉可能存在的 markdown 代码块
-    if raw.startswith("```"):
-        chunks = raw.split("```")
-        raw = chunks[1] if len(chunks) > 1 else raw.lstrip("`")
-        if raw.lower().startswith("json"):
-            raw = raw[4:]
-    try:
-        start = raw.index("{")
-        end = raw.rindex("}") + 1
-        data = json.loads(raw[start:end])
-        script = str(data.get("script", "")).strip()
-        titles = [str(t).strip() for t in (data.get("titles_zh") or [])][:expected_count]
-        if script:
-            return script, [t for t in titles if t]
-    except (ValueError, json.JSONDecodeError):
-        pass
-    return text.strip(), []
+def _parse_llm_output(text: str, expected_count: int) -> tuple[str, list[str]]:
+    """解析标记分隔格式的 LLM 输出，返回 (播报稿, 中文标题列表)。
+
+    兜底顺序：标准标记 → 从固定开头语锚定 → 整段文本直接当播报稿。
+    """
+    cleaned = _THINK_RE.sub("", text).strip()
+
+    m_script = re.search(r"【播报稿】\s*", cleaned)
+    script = cleaned[m_script.end():].strip() if m_script else ""
+
+    titles: list[str] = []
+    m_titles = re.search(r"【中文标题】\s*(.*?)\s*【播报稿】", cleaned, flags=re.S)
+    if m_titles:
+        titles = _split_titles(m_titles.group(1), expected_count)
+
+    if not script:
+        # 没有标记：优先从固定开头语锚定（推理模型常在正文前混入思考过程）
+        idx = cleaned.find(_OPENING)
+        if idx >= 0:
+            script = cleaned[idx:].strip()
+            # 开头语之前若存在标题段（标记形式或编号列表）则顺手提取
+            if not titles and idx > 0:
+                head = cleaned[:idx]
+                hm = re.search(r"【中文标题】\s*(.*)", head, flags=re.S)
+                src = hm.group(1) if hm else _harvest_numbered_titles(head)
+                if src:
+                    titles = _split_titles(src, expected_count)
+        else:
+            script = cleaned
+
+    return script, titles
 
 
 def _call_llm(user_prompt: str) -> str:
@@ -95,7 +140,7 @@ def _call_llm(user_prompt: str) -> str:
     }
 
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    with open_url(req, timeout=180) as resp:
+    with open_url(req, timeout=240) as resp:
         result = json.loads(resp.read().decode("utf-8"))
         return _extract_response_text(result)
 
@@ -119,7 +164,7 @@ def generate_script(news_items: list[dict]) -> dict:
 
     user_prompt = (
         f"以下是今天的 {len(news_items)} 条全球新闻，请翻译并改写成中文播报稿，"
-        f"titles_zh 必须包含 {len(news_items)} 项中文标题：\n\n{news_text}"
+        f"【中文标题】必须包含 {len(news_items)} 项（分号分隔）：\n\n{news_text}"
     )
 
     max_attempts = 3
@@ -128,9 +173,10 @@ def generate_script(news_items: list[dict]) -> dict:
         try:
             print(f"[AI] 尝试 {attempt}/{max_attempts}: {Config.LLM_API_BASE} 模型 {Config.LLM_MODEL}")
             text = _call_llm(user_prompt)
-            script, titles = _parse_llm_json(text, len(news_items))
-            if not script:
-                last_error = "响应中没有文本"
+            script, titles = _parse_llm_output(text, len(news_items))
+            # 成品稿必须是中文为主；否则视为推理污染，重试
+            if not script or _cjk_ratio(script) < 0.3:
+                last_error = "输出不是合格的中文播报稿"
                 print(f"[AI] {last_error}")
                 continue
             note = f"，中文标题 {len(titles)} 条" if titles else ""
