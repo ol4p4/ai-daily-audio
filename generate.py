@@ -65,9 +65,21 @@ def main():
         return False
     print(f"       抓取到 {len(news)} 条新闻")
 
-    # 2. AI 生成播报稿
+    # 2. AI 生成播报稿（含每条新闻的中文标题）
     print("\n[2/5] AI 生成播报稿...")
-    script_text = generate_script(news)
+    ai_result = generate_script(news)
+    script_text = ai_result["script"]
+
+    if not script_text:
+        print("[ERROR] AI 播报稿生成失败，发送降级通知邮件")
+        body = make_email_body(news, degraded=True)
+        send_email(
+            subject=f"AI 早报 [{date_str}] - ⚠️ AI 翻译服务异常，今日无音频",
+            body_html=body,
+        )
+        return False
+
+    titles_zh = ai_result.get("titles_zh") or []
     print(f"       播报稿 {len(script_text)} 字")
 
     # 3. 保存 Markdown 文字版
@@ -80,7 +92,7 @@ def main():
 
     if not success:
         print(f"[ERROR] 音频生成失败: {result}")
-        body = make_email_body(news)
+        body = make_email_body(news, titles_zh=titles_zh)
         send_email(
             subject=f"AI 早报 [{date_str}] - 音频生成失败",
             body_html=body + f"<p style='color:red;'>音频生成失败：{result}</p>",
@@ -92,7 +104,7 @@ def main():
 
     # 5. 推送邮件
     print("\n[5/5] 发送邮件...")
-    body = make_email_body(news, audio_file.name)
+    body = make_email_body(news, audio_file.name, titles_zh=titles_zh)
     email_success = send_email(
         subject=f"AI 早报 [{date_str}] - {len(news)} 条全球要闻",
         body_html=body,

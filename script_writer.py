@@ -1,13 +1,15 @@
 """
 AI 播报稿生成模块 - 全领域
-直接调用 OpenCode Zen API（伪造客户端请求头）
+调用 OpenAI 兼容 API（NVIDIA NIM），返回中文播报稿 + 各条新闻的中文标题
+出站请求统一走 safe_http 校验（防 SSRF）
 """
 import json
-import uuid
+import time
 from config import Config
+from safe_http import open_url
 
 
-SYSTEM_PROMPT = """你是一位专业的中文新闻播音员。你的任务是把给定的全球新闻翻译并改写成一段自然流畅的中文语音播报稿。
+SYSTEM_PROMPT = """你是一位专业的中文新闻播音员。你的任务是把给定的全球新闻翻译并改写成一段自然流畅的中文语音播报稿，并为每条新闻生成简短的中文标题。
 
 【重要性分层规则】
 - 头条新闻（前 3-5 条）：用 2-3 句话详细说明背景、影响和意义
@@ -22,12 +24,17 @@ SYSTEM_PROMPT = """你是一位专业的中文新闻播音员。你的任务是�
 5. 结尾："以上就是今天的全球要闻，祝你今天顺利。"
 
 【翻译规则】
-- 所有英文内容必须翻译成中文（公司名、人名、政策名可保留英文）
+- 所有内容必须翻译成中文（公司名、人名、政策名可保留英文）
 - 新闻之间用过渡句自然衔接
 - 不要使用任何 Markdown 格式、特殊符号、emoji
 - 英文公司名保留原文（如 OpenAI、Tesla、Federal Reserve）
 - 语气轻松专业，像朋友给你读新闻
-- 全文控制在 2000-3000 字"""
+- 播报稿全文控制在 2000-3000 字
+
+【输出格式】
+必须输出如下 JSON，不要输出任何其他文字，不要用 markdown 代码块包裹：
+{"script": "完整中文播报稿", "titles_zh": ["第1条的中文标题", "第2条的中文标题"]}
+titles_zh 数组长度必须等于输入新闻条数，顺序与输入一致，每条不超过 25 个汉字。"""
 
 
 def _extract_response_text(result: dict) -> str:
@@ -43,11 +50,65 @@ def _extract_response_text(result: dict) -> str:
     return ""
 
 
-def generate_script(news_items: list[dict]) -> str:
-    api_key = Config.OPENAI_API_KEY
-    if not api_key:
-        print("[AI] 未配置 OPENAI_API_KEY，降级为简单拼接模式")
-        return _fallback_script(news_items)
+def _parse_llm_json(text: str, expected_count: int) -> tuple[str, list[str]]:
+    """解析 LLM 返回的 JSON；解析不出时把整段文本当作播报稿（标题留空）"""
+    raw = text.strip()
+    # 容错：剥掉可能存在的 markdown 代码块
+    if raw.startswith("```"):
+        chunks = raw.split("```")
+        raw = chunks[1] if len(chunks) > 1 else raw.lstrip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:]
+    try:
+        start = raw.index("{")
+        end = raw.rindex("}") + 1
+        data = json.loads(raw[start:end])
+        script = str(data.get("script", "")).strip()
+        titles = [str(t).strip() for t in (data.get("titles_zh") or [])][:expected_count]
+        if script:
+            return script, [t for t in titles if t]
+    except (ValueError, json.JSONDecodeError):
+        pass
+    return text.strip(), []
+
+
+def _call_llm(user_prompt: str) -> str:
+    """单次调用 LLM，返回响应文本"""
+    import urllib.request
+
+    api_base = Config.LLM_API_BASE.rstrip("/")
+    url = f"{api_base}/chat/completions"
+    payload = json.dumps({
+        "model": Config.LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 6000,
+    }).encode("utf-8")
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
+    }
+
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    with open_url(req, timeout=180) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+        return _extract_response_text(result)
+
+
+def generate_script(news_items: list[dict]) -> dict:
+    """生成播报稿。
+
+    返回 {"script": str, "titles_zh": list[str]}；
+    全部尝试失败时 script 为空字符串，由调用方决定降级行为。
+    """
+    if not Config.OPENAI_API_KEY:
+        print("[AI] 未配置 OPENAI_API_KEY")
+        return {"script": "", "titles_zh": []}
 
     news_text = ""
     for i, item in enumerate(news_items, 1):
@@ -56,69 +117,39 @@ def generate_script(news_items: list[dict]) -> str:
         source = item.get("source", "")
         news_text += f"{i}. [{source}] {title}\n   摘要：{summary}\n\n"
 
-    user_prompt = f"以下是今天的 {len(news_items)} 条全球新闻，请翻译并改写成中文播报稿：\n\n{news_text}"
+    user_prompt = (
+        f"以下是今天的 {len(news_items)} 条全球新闻，请翻译并改写成中文播报稿，"
+        f"titles_zh 必须包含 {len(news_items)} 项中文标题：\n\n{news_text}"
+    )
 
-    try:
-        import urllib.request
-        import urllib.error
+    max_attempts = 3
+    last_error = ""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"[AI] 尝试 {attempt}/{max_attempts}: {Config.LLM_API_BASE} 模型 {Config.LLM_MODEL}")
+            text = _call_llm(user_prompt)
+            script, titles = _parse_llm_json(text, len(news_items))
+            if not script:
+                last_error = "响应中没有文本"
+                print(f"[AI] {last_error}")
+                continue
+            note = f"，中文标题 {len(titles)} 条" if titles else ""
+            print(f"[AI] 播报稿生成成功，共 {len(script)} 字{note}")
+            return {"script": script, "titles_zh": titles}
+        except Exception as e:
+            code = getattr(e, "code", None)
+            body = ""
+            if code is not None:
+                try:
+                    body = e.read().decode("utf-8", errors="replace")[:200]
+                except Exception:
+                    body = ""
+            last_error = f"HTTP {code} {body}" if code else str(e)
+            print(f"[AI] 第 {attempt} 次调用失败: {last_error.strip()}")
+            if attempt < max_attempts:
+                wait = 20 * attempt
+                print(f"[AI] {wait} 秒后重试...")
+                time.sleep(wait)
 
-        api_base = Config.LLM_API_BASE.rstrip("/")
-        model = Config.LLM_MODEL
-        url = f"{api_base}/chat/completions"
-
-        print(f"[AI] 请求: {url}")
-        print(f"[AI] 模型: {model}")
-
-        payload = json.dumps({
-            "model": model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.7,
-            "max_tokens": 4000,
-        }).encode("utf-8")
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "opencode/latest/1.3.15/cli",
-            "x-opencode-client": "cli",
-            "x-opencode-session": uuid.uuid4().hex,
-            "x-opencode-project": uuid.uuid4().hex[:8],
-            "x-opencode-request": uuid.uuid4().hex,
-        }
-
-        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            script = _extract_response_text(result)
-            if script:
-                print(f"[AI] 播报稿生成成功，共 {len(script)} 字")
-                return script
-            else:
-                print(f"[AI] 响应中没有找到文本")
-                return _fallback_script(news_items)
-
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:500]
-        print(f"[AI] API 返回 HTTP {e.code}: {body}")
-        return _fallback_script(news_items)
-    except Exception as e:
-        print(f"[AI] 调用失败: {e}")
-        return _fallback_script(news_items)
-
-
-def _fallback_script(news_items: list[dict]) -> str:
-    lines = ["早上好，以下是今天的全球要闻。"]
-    for i, item in enumerate(news_items, 1):
-        title = item.get("title", "").replace("【", "").replace("】", "")
-        if i < len(news_items):
-            transitions = ["接下来", "另外", "还有一条", "下面", "再来看看"]
-            transition = transitions[(i - 1) % len(transitions)]
-            lines.append(f"{transition}，第{i}条：{title}。")
-        else:
-            lines.append(f"最后，第{i}条：{title}。")
-    lines.append("以上就是今天的全球要闻，祝你今天顺利。")
-    return "。".join(lines)
+    print(f"[AI] 全部尝试失败: {last_error.strip()}")
+    return {"script": "", "titles_zh": []}

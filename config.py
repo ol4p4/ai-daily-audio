@@ -43,5 +43,5 @@ class Config:
     MAX_AUDIO_DURATION_MINUTES = int(ENV.get("MAX_AUDIO_DURATION_MINUTES", "5"))
 
     OPENAI_API_KEY = ENV.get("OPENAI_API_KEY", "")
-    LLM_API_BASE = ENV.get("LLM_API_BASE", "https://opencode.ai/zen/v1")
-    LLM_MODEL = ENV.get("LLM_MODEL", "deepseek-v4-flash-free")
+    LLM_API_BASE = ENV.get("LLM_API_BASE", "https://integrate.api.nvidia.com/v1")
+    LLM_MODEL = ENV.get("LLM_MODEL", "nvidia/nemotron-3-super-120b-a12b")
