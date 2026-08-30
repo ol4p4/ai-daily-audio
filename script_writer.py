@@ -40,11 +40,14 @@ SYSTEM_PROMPT = """你是一位专业的中文新闻播音员。你的任务是�
 不要输出任何思考过程、解释、标记符号或 markdown 代码块。"""
 
 _TITLES_PROMPT = """你是新闻编辑。为输入的每条新闻生成一个不超过 20 个汉字的简体中文标题。
-严格按输入顺序，把全部标题用分号（；）连成一段输出。
-只输出标题本身：不要编号、不要解释、不要输出任何其他内容。"""
+共 {count} 条新闻，标题条数必须与输入一致。
+只输出一行，以「中文标题：」开头，后面是用分号（；）连接的全部标题。
+不要思考过程、不要编号、不要解释、不要输出任何其他内容。
+输出示例：中文标题：英伟达发布新芯片；美联储暗示加息；特斯拉在华降价"""
 
 _THINK_RE = re.compile(r"<think>.*?</think>", flags=re.S)
 _OPENING = "早上好，以下是今天的全球要闻"
+_TITLES_MARKER_RE = re.compile(r"(?:【中文标题】|中文标题[:：])\s*")
 _MIN_SCRIPT_LEN = 500
 
 
@@ -88,14 +91,25 @@ def _parse_script(text: str) -> str:
     return cleaned
 
 
+def _extract_titles(raw: str, expected_count: int) -> list[str]:
+    """从响应中提取中文标题：剥离 think → 锚定「中文标题：」标记 → 拆分过滤。
+
+    nemotron 是推理模型，content 可能混入英文思考过程；没有锚定标记时退回整段文本。
+    """
+    cleaned = _THINK_RE.sub("", raw).strip()
+    m = _TITLES_MARKER_RE.search(cleaned)
+    src = cleaned[m.end():] if m else cleaned
+    return _split_titles(src, expected_count)
+
+
 def _split_titles(raw: str, expected_count: int) -> list[str]:
     """把标题段按分号/换行拆开，去掉编号前缀，过滤非中文与超长项"""
     raw = re.sub(r"^\s*\d+[\.、\)\)]\s*", "", raw, flags=re.M)
-    parts = [t.strip(" .。") for t in re.split(r"[；;\n]+", raw) if t.strip()]
+    parts = [t.strip(" .。*#•；;") for t in re.split(r"[；;\n]+", raw) if t.strip()]
     return [p for p in parts if _has_cjk(p) and len(p) <= 30][:expected_count]
 
 
-def _call_llm(system: str, user: str, max_tokens: int, label: str) -> str:
+def _call_llm(system: str, user: str, max_tokens: int, label: str, temperature: float = 0.7) -> str:
     """单次调用 LLM，返回响应文本"""
     import urllib.request
 
@@ -107,7 +121,7 @@ def _call_llm(system: str, user: str, max_tokens: int, label: str) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "temperature": 0.7,
+        "temperature": temperature,
         "max_tokens": max_tokens,
     }).encode("utf-8")
 
@@ -121,35 +135,19 @@ def _call_llm(system: str, user: str, max_tokens: int, label: str) -> str:
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     with open_url(req, timeout=240) as resp:
         result = json.loads(resp.read().decode("utf-8"))
+        choice = result["choices"][0]
+        # finish_reason=length 说明推理过程吃满 token 被截断，是解析为空的常见根因
+        print(f"[AI] {label} 返回 (finish_reason={choice.get('finish_reason')})")
         return _extract_response_text(result)
 
 
-def _retry_call(system: str, user: str, max_tokens: int, label: str) -> str:
-    """带重试的调用；全部失败抛出最后一次异常"""
-    last_err: Exception = RuntimeError("未执行")
-    for attempt in range(1, 4):
-        try:
-            return _call_llm(system, user, max_tokens, f"{label} [尝试 {attempt}/3]")
-        except Exception as e:
-            last_err = e
-            code = getattr(e, "code", None)
-            body = ""
-            if code is not None:
-                try:
-                    body = e.read().decode("utf-8", errors="replace")[:200]
-                except Exception:
-                    body = ""
-            detail = f"HTTP {code} {body}" if code else str(e)
-            print(f"[AI] 第 {attempt} 次调用失败: {detail.strip()}")
-            if attempt < 3:
-                wait = 20 * attempt
-                print(f"[AI] {wait} 秒后重试...")
-                time.sleep(wait)
-    raise last_err
-
-
 def generate_titles_zh(news_items: list[dict]) -> list[str]:
-    """为每条新闻生成中文标题；失败时返回空列表（邮件回退英文标题）"""
+    """为每条新闻生成中文标题；全部尝试失败返回空列表（邮件回退英文标题）。
+
+    带质量门禁：解析出的标题数 ≥ 80% 才算合格，否则换种子重试；
+    nemotron 推理预算可能吃满 max_tokens 导致输出被截断，重试是必要的兜底。
+    """
+    expected = len(news_items)
     lines = []
     for i, item in enumerate(news_items, 1):
         title = item.get("title", "")
@@ -158,20 +156,41 @@ def generate_titles_zh(news_items: list[dict]) -> list[str]:
         lines.append(f"{i}. [{source}] {title}：{summary}")
     user_prompt = "\n".join(lines)
 
+    best: list[str] = []
     try:
-        text = _retry_call(_TITLES_PROMPT, user_prompt, 2000, "生成中文标题")
-        cleaned = _THINK_RE.sub("", text).strip()
-        m = re.search(r"【中文标题】\s*(.*)", cleaned, flags=re.S)
-        src = m.group(1) if m else cleaned
-        titles = _split_titles(src, len(news_items))
-        if titles:
-            print(f"[AI] 中文标题生成成功，共 {len(titles)} 条")
-        else:
-            print("[AI] 中文标题解析结果为空")
-        return titles
+        for attempt in range(1, 4):
+            text = _call_llm(
+                _TITLES_PROMPT.format(count=expected), user_prompt, 4000,
+                f"生成中文标题 [尝试 {attempt}/3]", temperature=0.2,
+            )
+            titles = _extract_titles(text, expected)
+            if len(titles) >= max(1, int(expected * 0.8)):
+                best = titles
+                break
+            print(f"[AI] 第 {attempt} 次标题不合格（解析出 {len(titles)}/{expected} 条）")
+            # 留下最多的一次结果，全部失败时至少能部分中文化
+            if len(titles) > len(best):
+                best = titles
+            head = _THINK_RE.sub("", text).strip()[:150]
+            print(f"[AI] 原始响应开头: {head!r}")
+            if attempt < 3:
+                time.sleep(10)
     except Exception as e:
-        print(f"[AI] 中文标题生成失败（邮件将回退英文标题）: {e}")
+        code = getattr(e, "code", None)
+        body = ""
+        if code is not None:
+            try:
+                body = e.read().decode("utf-8", errors="replace")[:200]
+            except Exception:
+                body = ""
+        print(f"[AI] 中文标题生成失败（邮件将回退英文标题）: {(f'HTTP {code} ' + body) if code else e}")
         return []
+
+    if best:
+        print(f"[AI] 中文标题生成成功，共 {len(best)}/{expected} 条")
+    else:
+        print("[AI] 中文标题解析结果为空（邮件将回退英文标题）")
+    return best
 
 
 def generate_script(news_items: list[dict]) -> dict:
