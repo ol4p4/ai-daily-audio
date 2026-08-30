@@ -160,7 +160,7 @@ def generate_titles_zh(news_items: list[dict]) -> list[str]:
     try:
         for attempt in range(1, 4):
             text = _call_llm(
-                _TITLES_PROMPT.format(count=expected), user_prompt, 4000,
+                _TITLES_PROMPT.format(count=expected), user_prompt, 6000,
                 f"生成中文标题 [尝试 {attempt}/3]", temperature=0.2,
             )
             titles = _extract_titles(text, expected)
