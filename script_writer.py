@@ -43,7 +43,8 @@ _TITLES_PROMPT = """你是新闻编辑。为输入的每条新闻生成一个不
 共 {count} 条新闻，标题条数必须与输入一致。
 只输出一行，以「中文标题：」开头，后面是用分号（；）连接的全部标题。
 不要思考过程、不要编号、不要解释、不要输出任何其他内容。
-输出示例：中文标题：英伟达发布新芯片；美联储暗示加息；特斯拉在华降价"""
+输出示例：中文标题：英伟达发布新芯片；美联储暗示加息；特斯拉在华降价
+/no_think"""
 
 _THINK_RE = re.compile(r"<think>.*?</think>", flags=re.S)
 _OPENING = "早上好，以下是今天的全球要闻"
@@ -157,39 +158,38 @@ def generate_titles_zh(news_items: list[dict]) -> list[str]:
     user_prompt = "\n".join(lines)
 
     best: list[str] = []
-    try:
-        for attempt in range(1, 4):
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
             text = _call_llm(
-                _TITLES_PROMPT.format(count=expected), user_prompt, 6000,
+                _TITLES_PROMPT.format(count=expected), user_prompt, 8000,
                 f"生成中文标题 [尝试 {attempt}/3]", temperature=0.2,
             )
-            titles = _extract_titles(text, expected)
-            if len(titles) >= max(1, int(expected * 0.8)):
-                best = titles
-                break
-            print(f"[AI] 第 {attempt} 次标题不合格（解析出 {len(titles)}/{expected} 条）")
-            # 留下最多的一次结果，全部失败时至少能部分中文化
-            if len(titles) > len(best):
-                best = titles
-            head = _THINK_RE.sub("", text).strip()[:150]
-            print(f"[AI] 原始响应开头: {head!r}")
+        except Exception as e:
+            # 瞬时错误（如 NIM 503 过载）只损失单次尝试，不炸整个重试循环
+            last_err = e
+            print(f"[AI] 第 {attempt} 次调用异常: {e}")
             if attempt < 3:
-                time.sleep(10)
-    except Exception as e:
-        code = getattr(e, "code", None)
-        body = ""
-        if code is not None:
-            try:
-                body = e.read().decode("utf-8", errors="replace")[:200]
-            except Exception:
-                body = ""
-        print(f"[AI] 中文标题生成失败（邮件将回退英文标题）: {(f'HTTP {code} ' + body) if code else e}")
-        return []
+                time.sleep(20 * attempt)
+            continue
+        titles = _extract_titles(text, expected)
+        if len(titles) >= max(1, int(expected * 0.8)):
+            best = titles
+            break
+        print(f"[AI] 第 {attempt} 次标题不合格（解析出 {len(titles)}/{expected} 条）")
+        # 留下最多的一次结果，全部失败时至少能部分中文化
+        if len(titles) > len(best):
+            best = titles
+        head = _THINK_RE.sub("", text).strip()[:150]
+        print(f"[AI] 原始响应开头: {head!r}")
+        if attempt < 3:
+            time.sleep(10)
 
     if best:
         print(f"[AI] 中文标题生成成功，共 {len(best)}/{expected} 条")
     else:
-        print("[AI] 中文标题解析结果为空（邮件将回退英文标题）")
+        reason = f"（最后错误: {last_err}）" if last_err else ""
+        print(f"[AI] 中文标题解析结果为空（邮件将回退英文标题）{reason}")
     return best
 
 
@@ -213,26 +213,30 @@ def generate_script(news_items: list[dict]) -> dict:
     user_prompt = f"请把以下 {len(news_items)} 条全球新闻翻译并改写成中文播报稿：\n\n{news_text}"
 
     script = ""
-    try:
-        for attempt in range(1, 4):
+    for attempt in range(1, 4):
+        try:
             text = _call_llm(SYSTEM_PROMPT, user_prompt, 8000, f"生成播报稿 [尝试 {attempt}/3]")
-            script = _parse_script(text)
-            # 质量门禁：中文为主且达到最低长度，否则视为推理污染或截断，重试
-            if script and len(script) >= _MIN_SCRIPT_LEN and _cjk_ratio(script) >= 0.3:
-                break
-            print(f"[AI] 第 {attempt} 次输出不合格（长度 {len(script)}，CJK 占比 {_cjk_ratio(script):.0%}）")
-            script = ""
+        except Exception as e:
+            # 瞬时错误（如 NIM 503 过载）只损失单次尝试，不炸整个重试循环
+            code = getattr(e, "code", None)
+            body = ""
+            if code is not None:
+                try:
+                    body = e.read().decode("utf-8", errors="replace")[:200]
+                except Exception:
+                    body = ""
+            print(f"[AI] 第 {attempt} 次调用异常: {(f'HTTP {code} ' + body) if code else e}")
             if attempt < 3:
-                time.sleep(10)
-    except Exception as e:
-        code = getattr(e, "code", None)
-        body = ""
-        if code is not None:
-            try:
-                body = e.read().decode("utf-8", errors="replace")[:200]
-            except Exception:
-                body = ""
-        print(f"[AI] 播报稿调用失败: {(f'HTTP {code} ' + body) if code else e}")
+                time.sleep(20 * attempt)
+            continue
+        script = _parse_script(text)
+        # 质量门禁：中文为主且达到最低长度，否则视为推理污染或截断，重试
+        if script and len(script) >= _MIN_SCRIPT_LEN and _cjk_ratio(script) >= 0.3:
+            break
+        print(f"[AI] 第 {attempt} 次输出不合格（长度 {len(script)}，CJK 占比 {_cjk_ratio(script):.0%}）")
+        script = ""
+        if attempt < 3:
+            time.sleep(10)
 
     if not script:
         print("[AI] 播报稿生成最终失败")
