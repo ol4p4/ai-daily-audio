@@ -10,7 +10,7 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Probe candidate models
+      - name: Measure long-output throughput
         env:
           KEY: ${{ secrets.OPENAI_API_KEY }}
           BASE: ${{ secrets.LLM_API_BASE }}
@@ -22,21 +22,19 @@ jobs:
           key = os.environ.get("KEY") or ""
 
           models = [
-              "z-ai/glm-5.3-flash",
               "minimaxai/minimax-m3.1-flash",
-              "stepfun-ai/step-5-preview",
               "nvidia/nemotron-3.5-lightning-30b-a3b",
-              "openai/gpt-oss-20b",
+              "z-ai/glm-5.3-flash",
           ]
-
-          prompt = "把这句话翻译成中文，只输出译文：The Federal Reserve held interest rates steady on Wednesday, citing persistent inflation."
+          prompt = ("用中文写一段约 800 字的新闻播报稿，主题是今天全球财经与科技要闻，"
+                    "语气自然口语化，不要标题、不要 Markdown。")
 
           for m in models:
               payload = json.dumps({
                   "model": m,
                   "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0.2,
-                  "max_tokens": 3000,
+                  "temperature": 0.6,
+                  "max_tokens": 4000,
               }).encode()
               req = urllib.request.Request(
                   f"{base}/chat/completions", data=payload,
@@ -45,20 +43,20 @@ jobs:
               )
               t0 = time.time()
               try:
-                  with urllib.request.urlopen(req, timeout=180) as r:
+                  with urllib.request.urlopen(req, timeout=240) as r:
                       body = json.loads(r.read().decode())
                       ch = body["choices"][0]
                       msg = ch.get("message") or {}
-                      content = (msg.get("content") or "").strip()
-                      reasoning = (msg.get("reasoning_content") or msg.get("reasoning") or "")
-                      text = content or reasoning
+                      text = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "")
+                      dt = time.time() - t0
                       cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
+                      usage = body.get("usage") or {}
                       print(f"[OK] {m}")
-                      print(f"     dt={time.time()-t0:.1f}s finish={ch.get('finish_reason')} "
-                            f"content_len={len(content)} reasoning_len={len(reasoning)} cjk={cjk}")
-                      print(f"     sample={content[:80]!r}")
+                      print(f"     dt={dt:.1f}s chars={len(text)} cjk={cjk} rate={len(text)/max(dt,0.1):.1f} chars/s "
+                            f"finish={ch.get('finish_reason')} completion_tokens={usage.get('completion_tokens')}")
+                      print(f"     head={text[:60]!r}")
               except urllib.error.HTTPError as e:
                   print(f"[{e.code}] {m} {e.read().decode('utf-8','replace')[:140]}")
               except Exception as e:
-                  print(f"[ERR] {m} {type(e).__name__}: {e}")
+                  print(f"[ERR] {m} after {time.time()-t0:.0f}s {type(e).__name__}: {e}")
           PY
