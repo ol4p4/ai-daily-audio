@@ -215,7 +215,8 @@ def generate_script(news_items: list[dict]) -> dict:
     script = ""
     for attempt in range(1, 4):
         try:
-            text = _call_llm(SYSTEM_PROMPT, user_prompt, 8000, f"生成播报稿 [尝试 {attempt}/3]")
+            # 16000 而非 8000：30 条新闻时推理过程会吃满预算，8000 会导致正文被截断
+            text = _call_llm(SYSTEM_PROMPT, user_prompt, 16000, f"生成播报稿 [尝试 {attempt}/3]")
         except Exception as e:
             # 瞬时错误（如 NIM 503 过载）只损失单次尝试，不炸整个重试循环
             code = getattr(e, "code", None)
