@@ -1,0 +1,61 @@
+name: probe-llm
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe candidate models
+        env:
+          KEY: ${{ secrets.OPENAI_API_KEY }}
+          BASE: ${{ secrets.LLM_API_BASE }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request, urllib.error
+
+          base = (os.environ.get("BASE") or "https://integrate.api.nvidia.com/v1").rstrip("/")
+          key = os.environ.get("KEY") or ""
+          print("base host:", base.split("//")[-1].split("/")[0])
+          print("key present:", bool(key), "len:", len(key))
+
+          models = [
+              "nvidia/nemotron-3-super-120b-a12b",
+              "z-ai/glm-5.3-flash",
+              "deepseek-ai/deepseek-v4.1-flash",
+              "moonshotai/kimi-k2.6",
+              "minimaxai/minimax-m3.1-flash",
+              "stepfun-ai/step-5-preview",
+              "nvidia/nemotron-nano-3-30b-a3b",
+              "nvidia/nemotron-3.5-lightning-30b-a3b",
+              "openai/gpt-oss-20b",
+          ]
+
+          for m in models:
+              payload = json.dumps({
+                  "model": m,
+                  "messages": [{"role": "user", "content": "用一个中文短句说明今天适合做什么。"}],
+                  "temperature": 0.2,
+                  "max_tokens": 80,
+              }).encode()
+              req = urllib.request.Request(
+                  f"{base}/chat/completions", data=payload,
+                  headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      body = json.loads(r.read().decode())
+                      text = body["choices"][0]["message"].get("content") or ""
+                      cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
+                      print(f"[OK]   {m}  cjk={cjk}  sample={text[:60]!r}")
+              except urllib.error.HTTPError as e:
+                  detail = e.read().decode("utf-8", "replace")[:160]
+                  print(f"[{e.code}] {m}  {detail}")
+              except Exception as e:
+                  print(f"[ERR]  {m}  {type(e).__name__}: {e}")
+          PY
