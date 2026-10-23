@@ -45,3 +45,5 @@ class Config:
     OPENAI_API_KEY = ENV.get("OPENAI_API_KEY", "")
     LLM_API_BASE = ENV.get("LLM_API_BASE", "https://integrate.api.nvidia.com/v1")
     LLM_MODEL = ENV.get("LLM_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+    # 部分推理模型会把 token 预算耗在思考过程上，导致正文为空或截断；置 1 可关闭
+    LLM_DISABLE_THINKING = ENV.get("LLM_DISABLE_THINKING", "").strip().lower() in ("1", "true", "yes")

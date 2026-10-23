@@ -116,7 +116,7 @@ def _call_llm(system: str, user: str, max_tokens: int, label: str, temperature: 
 
     api_base = Config.LLM_API_BASE.rstrip("/")
     url = f"{api_base}/chat/completions"
-    payload = json.dumps({
+    body = {
         "model": Config.LLM_MODEL,
         "messages": [
             {"role": "system", "content": system},
@@ -124,7 +124,11 @@ def _call_llm(system: str, user: str, max_tokens: int, label: str, temperature: 
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
-    }).encode("utf-8")
+    }
+    # minimax 系列未关思考时会用英文反复自述任务，正文被挤空、标题解析不出来
+    if Config.LLM_DISABLE_THINKING or Config.LLM_MODEL.startswith("minimaxai/"):
+        body["chat_template_kwargs"] = {"thinking": False}
+    payload = json.dumps(body).encode("utf-8")
 
     headers = {
         "Content-Type": "application/json",
