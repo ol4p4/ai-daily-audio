@@ -9,8 +9,9 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
-      - name: Measure long-output throughput
+      - name: Long-form script quality check
         env:
           KEY: ${{ secrets.OPENAI_API_KEY }}
           BASE: ${{ secrets.LLM_API_BASE }}
@@ -21,42 +22,50 @@ jobs:
           base = (os.environ.get("BASE") or "https://integrate.api.nvidia.com/v1").rstrip("/")
           key = os.environ.get("KEY") or ""
 
-          models = [
-              "minimaxai/minimax-m3.1-flash",
-              "nvidia/nemotron-3.5-lightning-30b-a3b",
-              "z-ai/glm-5.3-flash",
-          ]
-          prompt = ("用中文写一段约 800 字的新闻播报稿，主题是今天全球财经与科技要闻，"
-                    "语气自然口语化，不要标题、不要 Markdown。")
+          prompt = ("用中文写一段约 2500 字的新闻播报稿，主题是今天全球财经、科技与政策要闻。"
+                    "要求：开头是“早上好，以下是今天的全球要闻”，分段自然，语气口语化，"
+                    "不要标题、不要 Markdown、不要任何英文思考过程。")
 
-          for m in models:
-              payload = json.dumps({
+          cases = [
+              ("nvidia/nemotron-3.5-lightning-30b-a3b", {}),
+              ("stepfun-ai/step-5-preview", {}),
+              ("deepseek-ai/deepseek-v4.1-flash", {}),
+              ("minimaxai/minimax-m3.1-flash", {"chat_template_kwargs": {"thinking": False}}),
+          ]
+
+          for m, extra in cases:
+              payload = {
                   "model": m,
                   "messages": [{"role": "user", "content": prompt}],
                   "temperature": 0.6,
-                  "max_tokens": 4000,
-              }).encode()
+                  "max_tokens": 16000,
+              }
+              payload.update(extra)
               req = urllib.request.Request(
-                  f"{base}/chat/completions", data=payload,
+                  f"{base}/chat/completions",
+                  data=json.dumps(payload).encode(),
                   headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
                   method="POST",
               )
               t0 = time.time()
               try:
-                  with urllib.request.urlopen(req, timeout=240) as r:
+                  with urllib.request.urlopen(req, timeout=200) as r:
                       body = json.loads(r.read().decode())
                       ch = body["choices"][0]
                       msg = ch.get("message") or {}
                       text = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "")
                       dt = time.time() - t0
                       cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
+                      latin = sum(1 for c in text if c.isascii() and c.isalpha())
                       usage = body.get("usage") or {}
-                      print(f"[OK] {m}")
-                      print(f"     dt={dt:.1f}s chars={len(text)} cjk={cjk} rate={len(text)/max(dt,0.1):.1f} chars/s "
-                            f"finish={ch.get('finish_reason')} completion_tokens={usage.get('completion_tokens')}")
-                      print(f"     head={text[:60]!r}")
+                      print(f"[OK] {m} opts={extra}")
+                      print(f"     dt={dt:.0f}s chars={len(text)} cjk={cjk} latin={latin} "
+                            f"finish={ch.get('finish_reason')} out_tokens={usage.get('completion_tokens')}")
+                      print(f"     head={text[:50]!r}")
+                      print(f"     tail={text[-50:]!r}")
               except urllib.error.HTTPError as e:
-                  print(f"[{e.code}] {m} {e.read().decode('utf-8','replace')[:140]}")
+                  print(f"[{e.code}] {m} {e.read().decode('utf-8','replace')[:120]}")
               except Exception as e:
                   print(f"[ERR] {m} after {time.time()-t0:.0f}s {type(e).__name__}: {e}")
+              time.sleep(5)
           PY
